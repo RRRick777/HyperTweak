@@ -18,7 +18,6 @@ import com.takekazex.hypertweak.presentation.icon.*
 import com.takekazex.hypertweak.settings.contract.IconConfigDecoder
 import com.takekazex.hypertweak.settings.contract.IconSlotPolicy
 import com.takekazex.hypertweak.settings.contract.IconSurface
-import com.takekazex.hypertweak.settings.contract.SystemUiSettingsKeys
 import com.takekazex.hypertweak.util.logging.DebugLog
 import com.takekazex.hypertweak.util.platform.ResourceLookup
 import java.lang.reflect.Constructor
@@ -31,21 +30,16 @@ import java.util.WeakHashMap
 import kotlin.math.abs
 
 /**
- * Applies the order policy at OS4's list factory and mirrors the block policy to modern containers.
- * The factory hook runs before StatusBarIconControllerImpl can bind its first holder; it only
- * reorders the existing `mSlots` ArrayList and adds empty Slot records for enabled module slots.
+ * 輕量化版本：移除所有 deoptimize() 與 onMeasure / onLayout 高頻攔截，
+ * 僅透過原生 setIgnoredSlots / addIgnoredSlots 實現「狀態欄隱藏圖標、控制中心顯示」。
  */
 internal object SlotMaskApplier : IconRenderer() {
     override val hostCallbackOrder = 10
-    // Published on settings acceptance; hook callbacks perform no storage reads.
     private val settingCcIconRowOverrides by hookSetting(emptySet()) {
         Preferences.iconConfig().controlCenter.iconRowOverrides
     }
 
     init {
-        hostRecovery(HostRecoveryPhase.SLOT_ORDER, icons = true) {
-            it.controller?.let { controller -> recoverSlotOrder(controller, it.context) }
-        }
         hostRecovery(HostRecoveryPhase.CONTAINERS, icons = true) {
             recoverExistingContainers(it.views)
         }
@@ -69,17 +63,6 @@ internal object SlotMaskApplier : IconRenderer() {
         val nativeVisibleStates: WeakHashMap<View, Int> = WeakHashMap()
     )
 
-    private data class HostRowStateAccess(
-        val layoutStates: Field,
-        val view: Field,
-        val visibleState: Field,
-        val hiddenBySpace: Field,
-        val inIslandState: Field,
-        val gone: Field,
-        val translationX: Field,
-        val layoutTranslationX: Field
-    )
-
     private val mainHandler = Handler(Looper.getMainLooper())
     private val stateLock = Any()
     private val containerStates = generationMainResource(WeakHashMap<Any, ContainerState>()) { it.clear() }
@@ -90,45 +73,23 @@ internal object SlotMaskApplier : IconRenderer() {
     private val duoSlots = IconSlotParts.NETWORK_SLOTS + "airplane"
 
     private var options by generationState { IconTunerOptions.snapshot() }
-
     private var restoring by generationState { false }
     @Volatile
     private var retiring = false
     init { generationCleanup { retiring = true } }
-    private var applyingNativeVisibility by generationState { false }
-    private var applyingNativeViewVisibility by generationState { false }
-    private val nativeViewVisibility = NativeViewVisibilityMask(View.GONE)
-    private var mobileViewClass: Class<*>? by generationState { null }
-    private var wifiViewClass: Class<*>? by generationState { null }
 
-    private val networkVisibility = generationMainResource(LinkedHashMap<Class<*>, Method>()) { it.clear() }
-    private val clipStates = generationMainResource(WeakHashMap<ViewGroup, Pair<Boolean, Boolean>>()) { it.clear() }
     private var rowOverrides: Set<String> by generationState { emptySet() }
-    private val rowLayoutOwners = generationMainResource(WeakHashMap<ViewGroup, Boolean>()) { it.clear() }
-    /** Lower-row and Duo overlays share leases for both native copies. */
-    private class LowerRowMotion(val source: View, val target: View) {
-        val motion = LeftPanelMotion { target.postInvalidateOnAnimation() }
-        var savedAlpha = source.alpha
-        var appliedAlpha = source.alpha
-        fun restore() {
-            motion.clear()
-            if (abs(source.alpha - appliedAlpha) < .001f) source.alpha = savedAlpha
-            HandoverCoordinator.statusIcons.release(source, this)
-            HandoverCoordinator.statusIcons.release(target, this)
-        }
-    }
-    private val lowerRowMotions = generationMainResource(IdentityHashMap<View, LowerRowMotion>()) {
-        it.values.forEach(LowerRowMotion::restore)
-        it.clear()
-    }
-    private val lastRestoredOverflow = generationMainResource(WeakHashMap<ViewGroup, Set<String>>()) { it.clear() }
-    private val activeHostLayouts = ThreadLocal<ArrayDeque<ViewGroup>>()
     private var originalSlotOrder by generationState { emptyList<String>() }
     private var slotsField: Field? by generationState { null }
     private var slotNameField: Field? by generationState { null }
     private var ignoredSlotsField: Field? by generationState { null }
     private var layoutFromField: Field? by generationState { null }
     private var slotConstructor: Constructor<*>? by generationState { null }
+
+    internal val typeOnlyInstalled get() = false
+    private var stackedPublished by generationState { false }
+    internal fun stackedReady(ready: Boolean) { stackedPublished = ready }
+    internal fun releaseStacked() = stackedReady(false)
 
     override fun saveHotReloadState(): Any = HostAccess.onMain {
         mapOf("order" to ArrayList(originalSlotOrder), "containers" to synchronized(stateLock) {
@@ -137,7 +98,6 @@ internal object SlotMaskApplier : IconRenderer() {
     }
 
     override fun restoreHotReloadState(state: Any?) {
-        // Accept snapshots from the previous build as well as the versioned map.
         val saved = (state as? Map<*, *>)?.get("containers") as? List<*> ?: state as? List<*> ?: return
         HostAccess.onMain {
             originalSlotOrder = ((state as? Map<*, *>)?.get("order") as? List<*>)?.filterIsInstance<String>().orEmpty()
@@ -151,23 +111,12 @@ internal object SlotMaskApplier : IconRenderer() {
     }
 
     internal fun recoverSlotOrder(controller: Any, context: Context) {
-        val list = HostAccess.read(controller, "mStatusBarIconList") ?: error("Missing host icon list")
-        if (originalSlotOrder.isEmpty()) {
-            val id = ResourceLookup.identifier(context.resources, "config_statusBarIcons", "array", "com.android.systemui")
-            check(id != 0) { "Missing native status icon order" }
-            originalSlotOrder = context.resources.getStringArray(id).toList()
-        }
-        rewriteIconList(list)
+        // 保持原生槽位順序，避免重寫導致的高額重綁開銷
     }
 
-    /**
-     * Re-merges every tracked container's ignored slots after a policy-only settings change. Slot
-     * order is untouched: order changes still rebuild the groups. Main thread only.
-     */
     internal fun refreshPolicy() {
         if (retiring) return
         options = IconTunerOptions.snapshot()
-        applyMobilePlan()
         rowOverrides = settingCcIconRowOverrides
         val tracked = synchronized(stateLock) { containerStates.entries.map { it.key to it.value } }
         tracked.forEach { (container, state) ->
@@ -176,9 +125,8 @@ internal object SlotMaskApplier : IconRenderer() {
                 if (merged != state.lastApplied) {
                     state.lastApplied = merged
                     restoreIgnoredSlots(container, merged)
+                    (container as? View)?.requestLayout()
                 }
-                // The control-center row split is re-derived on layout even when nothing is hidden.
-                (container as? View)?.requestLayout()
             }.onFailure { DebugLog.w(TAG, "live icon policy refresh failed", it) }
         }
     }
@@ -198,26 +146,13 @@ internal object SlotMaskApplier : IconRenderer() {
 
     override fun onPrepareHotReload() {
         retiring = true
-        HostAccess.onMain { releaseMobile(); typeOnly.retire() }
         mainHandler.removeCallbacksAndMessages(null)
-        // The replacement callback runs off the UI thread. Restore only the mutable container
-        // lists on the main thread. The replacement rebuilds groups before changing slot indices.
         val pending = synchronized(stateLock) { containerStates.entries.map { it.key to it.value } }
         HostAccess.onMain {
             restoring = true
             maskOwners.clear()
             try {
-                lastRestoredOverflow.clear()
-                clearLowerRowHandover()
-                rowLayoutOwners.keys.toList().forEach { it.requestLayout() }
-                rowLayoutOwners.clear()
-                clipStates.forEach { (group, flags) ->
-                    if (!group.clipChildren) group.clipChildren = flags.first
-                    if (!group.clipToPadding) group.clipToPadding = flags.second
-                }
-                clipStates.clear()
                 pending.forEach { (container, state) ->
-                    hideNativeNetworkChildren(container)
                     restoreIgnoredSlots(container, state.hostIgnored.toList())
                     (container as? View)?.requestLayout()
                 }
@@ -228,202 +163,13 @@ internal object SlotMaskApplier : IconRenderer() {
         }
     }
 
-    init { hostRecovery(HostRecoveryPhase.ICONS, icons = true) { typeOnly.adopt(it.views) } }
-    private val typeOnly = NativeTypeOnlyMask(this, onContractBroken = {
-        // The stacked bars need the type-only row; re-evaluate them and drop the holder.
-        stackedPublished = false
-        applyMobilePlan()
-        IconHostPorts.stackedTypeOnlyLost()
-    }) { root ->
-        (root.parent as? View)?.let(::planSurfaceFor)
-    }
-    private var mobileMasks by generationState { emptyMap<PlanSurface, NativeMobileMask>() }
-    /** Installed and no living row has broken the per-row layout contract. */
-    internal val typeOnlyInstalled get() = typeOnly.usable
-    private var stackedPublished by generationState { false }
-    internal fun stackedReady(ready: Boolean) {
-        stackedPublished = ready
-        applyMobilePlan()
-    }
-    internal fun releaseStacked() = stackedReady(false)
-    private fun applyMobilePlan() {
-        val state = MobileSignalHub.state
-        val network = NetworkDisplayModel(state, NetworkHub.state.wifiDefault == true,
-            NetworkHub.state.wifiLevel != null, slotOf = { id ->
-                runCatching { SubscriptionManager.getSlotIndex(id) }.getOrDefault(-1)
-            }, visibility = mobilePolicy)
-        val ready = stackedPublished && currentConfig.hasStackedSignal
-        val claims = PlanSurface.entries.filter { it != PlanSurface.AOD }.map { surface ->
-            Claim(RendererId.STACKED, surface,
-                state.subscriptionOrder.mapTo(linkedSetOf()) { SlotPart.MobileBars(it) }, ready, 100)
-        }
-        val plan = IconLayoutPlan.plan(currentConfig, network, claims)
-        mobileMasks = PlanSurface.entries.associateWith {
-            network.nativeMask(plan[it], options.ignoreSystemHide)
-        }
-        typeOnly.publish(mobileMasks.mapValues { it.value.typeOnly })
-        // A VM is shared by several surfaces. Its Pair flow must keep the host's original value;
-        // per-surface whole-row masks are applied below at each concrete native view.
-        MobileSignalVisibility.setHiddenForSubIds(emptySet())
-        synchronized(stateLock) { containerStates.keys.toList() }.forEach(::hideNativeNetworkChildren)
-    }
-    private fun releaseMobile() {
-        mobileMasks = emptyMap()
-        typeOnly.publish(emptyMap())
-        MobileSignalVisibility.setHiddenForSubIds(emptySet())
-    }
-
-    private fun mobileRowMasked(view: View): Boolean {
-        if (retiring || mobileViewClass?.isInstance(view) != true) return false
-        val surface = view.parent?.let(::planSurfaceFor) ?: return false
-        val subId = HostAccess.read(view, "subId") as? Int ?: return false
-        return subId in mobileMasks[surface]?.hidden.orEmpty()
-    }
-
     override fun onHook() {
-        typeOnly.install()
-        MobileSignalHub.subscribe(this, ::applyMobilePlan)
-        NetworkHub.subscribe(this, ::applyMobilePlan)
         retiring = false
-        IconTunerFlows.init(classLoader)
         options = IconTunerOptions.snapshot()
         rowOverrides = settingCcIconRowOverrides
-        hookStatusBarIconListFactory()
+        // 只 Hook 容器的 ignoredSlots 設定方法，徹底移除 deoptimize()、onMeasure、onLayout 攔截！
         hookIgnoredSlots()
-        networkVisibility.clear()
-        listOf(
-            "com.android.systemui.statusbar.pipeline.mobile.ui.view.ModernStatusBarMobileView",
-            "com.android.systemui.statusbar.pipeline.shared.ui.view.ModernStatusBarView"
-        ).forEach { name ->
-            val type = name.toClassOrNull() ?: return@forEach
-            val method = type.declaredMethods.singleOrNull {
-                it.name == "setVisibleState" && it.parameterTypes.contentEquals(arrayOf(
-                    Int::class.javaPrimitiveType, Boolean::class.javaPrimitiveType))
-            }?.apply { isAccessible = true } ?: return@forEach
-            networkVisibility[type] = method
-            if (name.endsWith(".ModernStatusBarMobileView")) mobileViewClass = type
-            deoptimize(method)
-            method.observe { before { param ->
-                val view = param.thisObject as? View ?: return@before
-                val container = view.parent ?: return@before
-                val slot = runCatching { findField(type, "slot")?.get(view) as? String }.getOrNull()
-                if (slot != null && (slot in maskSlotsFor(container) || mobileRowMasked(view))) {
-                    // Save host-visible requests before forcing this container's network child
-                    // closed. Calls with state 2 can be the superclass half of a subclass call,
-                    // so keep the last explicit visible state while our mask is active.
-                    if (!applyingNativeVisibility && param.args.getOrNull(0) != 2) {
-                        containerStates[container]?.nativeVisibleStates?.set(view,
-                            param.args[0] as? Int ?: return@before)
-                    }
-                    param.args[0] = 2
-                }
-            } }
-        }
-        // MiuiStatusIconContainer measures StatusIconDisplayable.isIconVisible(), even for
-        // GONE children. Mask its model admission too, or a hidden SIM still reserves its width.
-        "com.android.systemui.statusbar.pipeline.shared.ui.view.ModernStatusBarView".toClassOrNull()?.let { type ->
-            HostAccess.declaredMethod(type, "isIconVisible", accessible = true)?.takeIf {
-                it.returnType == Boolean::class.javaPrimitiveType
-            }?.let { method ->
-                deoptimize(method)
-                method.observe { before { param ->
-                    val view = param.thisObject as? View ?: return@before
-                    if (mobileRowMasked(view)) param.result = false
-                } }
-            }
-        }
-        wifiViewClass = "com.android.systemui.statusbar.pipeline.wifi.ui.view.ModernStatusBarWifiView".toClassOrNull()
-        listOfNotNull(mobileViewClass, wifiViewClass).forEach(::hookNativeVisibility)
-        DebugLog.i(TAG, "IconPosition hooks installed")
-    }
-
-    /** MIUI's binder writes View visibility independently of the icon container's visible state. */
-    private fun hookNativeVisibility(target: Class<*>) {
-        ViewVisibilityRouter.visibility(this, target, before = route@{ view, requested ->
-            if (applyingNativeViewVisibility || Looper.myLooper() != Looper.getMainLooper()) return@route null
-            val container = view.parent ?: return@route null
-            val slot = slotOf(view) ?: return@route null
-            val masked = slot in maskSlotsFor(container) || mobileRowMasked(view)
-            if (masked && containerStates[container] == null) {
-                val ignored = ignoredSlotsField?.get(container) as? List<*> ?: return@route null
-                captureContainerState(container, ignored)
-            }
-            nativeViewVisibility.hostRequest(view, requested, masked)
-        })
-    }
-
-    private fun reconcileNativeVisibility(view: View, masked: Boolean) {
-        if (mobileViewClass?.isInstance(view) != true && wifiViewClass?.isInstance(view) != true) return
-        val visibility = nativeViewVisibility.reconcile(view, view.visibility, masked)
-        if (view.visibility == visibility) return
-        applyingNativeViewVisibility = true
-        try {
-            view.visibility = visibility
-        } finally {
-            applyingNativeViewVisibility = false
-        }
-    }
-
-    private fun hookStatusBarIconListFactory() {
-        val factoryClass = LIST_FACTORY_CLASS.toClassOrNull()
-        if (factoryClass == null) {
-            DebugLog.hookSkipped(TAG, LIST_FACTORY_CLASS, "class not found")
-            return
-        }
-        val method = factoryClass.declaredMethods.singleOrNull { candidate ->
-            Modifier.isStatic(candidate.modifiers) &&
-                candidate.name == "provideStatusBarIconList" &&
-                candidate.parameterTypes.size == 1 &&
-                Context::class.java.isAssignableFrom(candidate.parameterTypes[0]) &&
-                candidate.returnType.name == LIST_CLASS
-        }
-        if (method == null) {
-            DebugLog.hookSkipped(TAG, "$LIST_FACTORY_CLASS#provideStatusBarIconList", "method not found or ambiguous")
-            return
-        }
-        method.isAccessible = true
-        deoptimize(method)
-        method.observe {
-            after { param ->
-                runCatching { rewriteIconList(param.result) }
-                    .onFailure { DebugLog.w(TAG, "status-bar slot order rewrite failed", it) }
-            }
-        }
-    }
-
-    private fun rewriteIconList(listObject: Any?) {
-        if (listObject == null) return
-        @Suppress("UNCHECKED_CAST") // Host slot list; every element is shape-checked below.
-        val slots = (slotsField ?: findField(listObject.javaClass, "mSlots").also { slotsField = it })
-            ?.get(listObject) as? MutableList<Any?> ?: return
-        val current = slots.mapNotNull { rawSlot ->
-            val slot = rawSlot ?: return@mapNotNull null
-            val name = readSlotName(slot) ?: return@mapNotNull null
-            name to slot
-        }
-        val currentNames = current.map { it.first }
-        if (originalSlotOrder.isEmpty()) originalSlotOrder = currentNames
-        val normalizedNames = IconSlotPolicy.normalizeHostCatalog(originalSlotOrder, currentNames, options.policy)
-        if (normalizedNames == currentNames) return
-
-        val byName = LinkedHashMap<String, Any>()
-        current.forEach { (name, slot) -> byName.putIfAbsent(name, slot) }
-        normalizedNames.forEach { name ->
-            if (!byName.containsKey(name)) {
-                createSlot(listObject, name)?.let { byName[name] = it }
-            }
-        }
-        val rewritten = normalizedNames.mapNotNull(byName::get)
-        if (rewritten.size != normalizedNames.size) {
-            DebugLog.w(TAG, "slot order skipped because a module Slot could not be created")
-            return
-        }
-        // The factory exposes an unmodifiable *view* of this same mutable list. Preserve identity.
-        val viewOnly = findField(listObject.javaClass, "mViewOnlySlots")
-        check(viewOnly?.get(listObject) is List<*>) { "Missing native slot view" }
-        slots.clear()
-        slots.addAll(rewritten)
-        DebugLog.i(TAG, "StatusBarIconList slots reordered count=${rewritten.size}")
+        DebugLog.i(TAG, "Lightweight SlotMaskApplier hooks installed (No deoptimize / No onLayout)")
     }
 
     private fun hookIgnoredSlots() {
@@ -440,142 +186,6 @@ internal object SlotMaskApplier : IconRenderer() {
         }
         hookContainerMethod(containerClass, "setIgnoredSlots")
         hookContainerMethod(containerClass, "addIgnoredSlots")
-        HostAccess.declaredMethod(containerClass, "onViewAdded", View::class.java, accessible = true)?.observe {
-            after { param ->
-                if (!retiring) hideNativeNetworkChildren(param.thisObject)
-            }
-        }
-        hookTwoLineHostState(containerClass)
-        HostAccess.declaredMethod(containerClass, "onMeasure", Int::class.javaPrimitiveType!!,
-            Int::class.javaPrimitiveType!!, accessible = true)?.let(::deoptimize)
-        // View.onLayout is (changed, left, top, right, bottom): five parameters. A four-parameter
-        // query silently misses this final host override, leaving every icon at the host's row.
-        containerClass.findMethodOrNull { name("onLayout"); paramCount(5) }?.let { method ->
-            deoptimize(method)
-            method.observe {
-                before { param ->
-                    val container = param.thisObject as? ViewGroup ?: return@before
-                    if (!retiring) hideNativeNetworkChildren(container)
-                    if (ownsTwoLineLayout(container)) {
-                        val stack = activeHostLayouts.get() ?: ArrayDeque<ViewGroup>().also {
-                            activeHostLayouts.set(it)
-                        }
-                        stack.addLast(container)
-                        rowLayoutOwners[container] = true
-                    } else if (container.javaClass.name == CONTAINER_CLASS && isControlCenterContainer(container)) {
-                        runCatching { clearCarrierRowSlack(container) }
-                            .onFailure { DebugLog.w(TAG, "carrier row budget reset failed", it) }
-                    }
-                }
-                after { param ->
-                    val container = param.thisObject as? ViewGroup ?: return@after
-                    val active = activeHostLayouts.get()
-                    if (active?.peekLast() === container) active.removeLast()
-                    if (active?.isEmpty() == true) activeHostLayouts.remove()
-                    if (!retiring) CellularTypeIconHooker.onTypeOrderContainerLayout(container, ::disableClipping)
-                }
-            }
-        }
-    }
-
-    /** The host computes overflow just before this call and applies each state immediately after. */
-    private fun hookTwoLineHostState(containerClass: Class<*>) {
-        val stateClass = "com.android.systemui.statusbar.views.NewStatusIconState".toClassOrNull()
-        val access = stateClass?.let { state ->
-            val layoutStates = findField(containerClass, "layoutStates")
-            val view = findField(state, "view")
-            val visibleState = findField(state, "visibleState")
-            val hiddenBySpace = findField(state, "hiddenBySpace")
-            val inIslandState = findField(state, "inIslandState")
-            val gone = findField(state, "gone")
-            val translationX = findField(state, "translationX")
-            val layoutTranslationX = findField(state, "layoutTranslationX")
-            if (layoutStates == null || view == null || visibleState == null ||
-                hiddenBySpace == null || inIslandState == null || gone == null ||
-                translationX == null || layoutTranslationX == null
-            ) null else HostRowStateAccess(
-                layoutStates, view, visibleState, hiddenBySpace, inIslandState, gone, translationX, layoutTranslationX
-            )
-        }
-        val method = containerClass.findMethodOrNull { name("enableAnimation\$1"); noParams() }
-        if (access == null || method == null) {
-            DebugLog.hookSkipped(TAG, "$CONTAINER_CLASS#enableAnimation\$1", "two-line state boundary unavailable")
-            return
-        }
-        deoptimize(method)
-        method.observe {
-            after { param ->
-                val container = param.thisObject as? ViewGroup ?: return@after
-                if (activeHostLayouts.get()?.peekLast() !== container) return@after
-                runCatching {
-                    restoreTwoLineOverflowStates(container, access)
-                    prepareControlCenterRows(container, access)
-                }.onFailure { DebugLog.w(TAG, "two-line host state failed", it) }
-            }
-        }
-        DebugLog.hookRegistered(TAG, "two-line host overflow state")
-    }
-
-    private fun ownsTwoLineLayout(container: ViewGroup): Boolean {
-        if (container.javaClass.name != CONTAINER_CLASS ||
-            !ControlCenterHeaderHooker.secondRowStatusIconsEnabled(container.context)
-        ) return false
-        val layoutFrom = runCatching { layoutFromField?.getInt(container) }.getOrNull()
-        // A single SIM uses the host's ordinary one-row layout and overflow policy. Keep the
-        // saved row overrides untouched; two SIMs reacquire the split layout automatically.
-        return IconSlotPolicy.ownsTwoLineControlCenterRow(layoutFrom) &&
-            isControlCenterContainer(container) && controlCenterRowGeometry(container)?.rowCount == 2
-    }
-
-    private fun restoreTwoLineOverflowStates(container: ViewGroup, access: HostRowStateAccess) {
-        val states = access.layoutStates.get(container) as? List<*> ?: return
-        val ignored = ignoredSlotsField?.get(container) as? List<*> ?: return
-        val restoredSlots = LinkedHashSet<String>()
-        for (raw in states) {
-            val state = raw ?: continue
-            if (access.visibleState.getInt(state) != 2 || !access.hiddenBySpace.getBoolean(state)) {
-                continue
-            }
-            val view = access.view.get(state) as? View ?: continue
-            if (view.parent !== container || view.isGone) continue
-            val slot = slotOf(view) ?: continue
-            val iconVisibleMethod = HostAccess.cached(view.javaClass, "icon-position:iconVisibleGetters", Method::class.java) {
-                findNoArgMethod(view.javaClass, "isIconVisible")
-            } ?: continue
-            val iconVisible = runCatching { iconVisibleMethod.invoke(view) as? Boolean }
-                .getOrNull() ?: continue
-            val iconBlockedMethod = HostAccess.cached(view.javaClass, "icon-position:iconBlockedGetters", Method::class.java) {
-                findNoArgMethod(view.javaClass, "isIconBlocked")
-            } ?: continue
-            val iconBlocked = runCatching { iconBlockedMethod.invoke(view) as? Boolean }
-                .getOrNull() ?: continue
-            val removeFlagMethod = HostAccess.cached(view.javaClass, "icon-position:removeFlagGetters", Method::class.java) {
-                findNoArgMethod(view.javaClass, "getRemoveFlag")
-            } ?: continue
-            val removeFlag = runCatching { removeFlagMethod.invoke(view) as? Boolean }
-                .getOrNull() ?: continue
-            if (IconSlotPolicy.shouldRestoreTwoLineOverflow(
-                    visibleState = 2,
-                    hiddenBySpace = true,
-                    inIslandState = access.inIslandState.getInt(state),
-                    iconVisible = iconVisible,
-                    iconBlocked = iconBlocked,
-                    ignored = slot in ignored,
-                    removing = removeFlag,
-                    gone = access.gone.getBoolean(state)
-                )
-            ) {
-                access.visibleState.setInt(state, 0)
-                access.hiddenBySpace.setBoolean(state, false)
-                restoredSlots += slot
-            }
-        }
-        if (lastRestoredOverflow[container] != restoredSlots) {
-            lastRestoredOverflow[container] = restoredSlots
-            if (restoredSlots.isNotEmpty()) {
-                DebugLog.i(TAG, "control-center overflow restored slots=$restoredSlots")
-            }
-        }
     }
 
     private fun hookContainerMethod(containerClass: Class<*>, methodName: String) {
@@ -623,11 +233,9 @@ internal object SlotMaskApplier : IconRenderer() {
         }
     }
 
-    /** Slots currently owned by a module overlay on this container. */
     private fun maskSlotsFor(container: Any): List<String> =
         planSurfaceFor(container)?.let { maskOwners.slots(container, it) }.orEmpty()
 
-    /** The binding supplies AOD phase; other containers use the verified host layout role. */
     private fun planSurfaceFor(container: Any): PlanSurface? = duoSurfaces[container] ?: when (
         runCatching { layoutFromField?.getInt(container) }.getOrNull()
     ) {
@@ -649,21 +257,7 @@ internal object SlotMaskApplier : IconRenderer() {
     }
 
     private fun blockedFor(container: Any, surface: IconSurface, systemSlots: List<String>): List<String> {
-        val blocked = if (surface == IconSurface.CONTROL_CENTER &&
-            IconSlotPolicy.ownsTwoLineControlCenterRow(
-                runCatching { layoutFromField?.getInt(container) }.getOrNull()
-            ) &&
-            ControlCenterHeaderHooker.twoLineConfigured()
-        ) {
-            IconSlotPolicy.blockedForTwoLineControlCenter(options.policy)
-        } else {
-            IconSlotPolicy.blockedFor(surface, systemSlots, options.policy)
-        }
-        val planSurface = planSurfaceFor(container)
-        return if (currentConfig.duoExpandedStacked && !currentConfig.stackedSignalOn(planSurface) ||
-            planSurface == PlanSurface.CONTROL_CENTER_EXPANDED && mobilePolicy.needsNativeControlCenter) {
-            (blocked + IconSlotPolicy.SLOT_STACKED_SIGNAL).distinct()
-        } else blocked
+        return IconSlotPolicy.blockedFor(surface, systemSlots, options.policy)
     }
 
     private fun restoreIgnoredSlots(container: Any, values: List<String>) {
@@ -672,144 +266,19 @@ internal object SlotMaskApplier : IconRenderer() {
             return
         }
         runCatching {
-            @Suppress("UNCHECKED_CAST") // Host slot list; entries are mask owners we wrote earlier.
+            @Suppress("UNCHECKED_CAST")
             val ignored = ignoredSlotsField?.get(container) as? MutableList<Any?> ?: return
             ignored.clear()
             ignored.addAll((values + maskSlotsFor(container)).distinct())
         }.onFailure { DebugLog.w(TAG, "ignoredSlots restore failed", it) }
     }
 
-    /** Independent, container-local owners; no shared visibility Flow is changed. */
-    fun setDuoMask(container: Any, active: Boolean, surface: PlanSurface? = null): Boolean {
-        if (retiring) return !active
-        if (Looper.myLooper() != Looper.getMainLooper()) return rejectMask(RendererId.DUO, "off the main thread")
-        if (active && surface == null) return rejectMask(RendererId.DUO, "surface unavailable")
-        if (active) duoSurfaces[container] = surface!! else duoSurfaces.remove(container)
-        return setContainerMask(container, if (active) duoSlots else emptySet(), RendererId.DUO)
-    }
-
-    internal fun duoOwnsAirplane(container: Any): Boolean =
-        "airplane" in maskOwners.owned(container, RendererId.DUO)
-
-    internal fun setCarrierMask(container: Any, mask: CarrierMask): Boolean =
-        setContainerMask(container, mask.slots(), RendererId.CARRIER)
-
-    /** The control-center carrier label draws the airplane glyph, so the header's native slot yields. */
-    internal fun setAirplaneLabelMask(container: Any, active: Boolean): Boolean =
-        setContainerMask(container, if (active) setOf(IconSlotPolicy.SLOT_AIRPLANE) else emptySet(), RendererId.AIRPLANE)
-
-    private fun setContainerMask(
-        container: Any,
-        slots: Set<String>,
-        owner: RendererId
-    ): Boolean {
-        if (retiring) return slots.isEmpty()
-        if (Looper.myLooper() != Looper.getMainLooper()) return rejectMask(owner, "off the main thread")
-        // Claims resolve per plan surface. An unknown host role would resolve to no mask, and the
-        // host-list comparison below would then report that empty result as an accepted mask.
-        if (slots.isNotEmpty() && planSurfaceFor(container) == null) return rejectMask(owner, "surface unavailable")
-        return runCatching {
-            val ignored = ignoredSlotsField?.get(container) as? List<*>
-                ?: return rejectMask(owner, "ignoredSlots unavailable")
-            val state = synchronized(stateLock) {
-                containerStates[container] ?: ContainerState(stableStrings(ignored)).also {
-                    containerStates[container] = it
-                }
-            }
-            val base = state.lastApplied ?: blockedFor(
-                container, surfaceFor(container, state.hostIgnored), state.hostIgnored
-            )
-            if (maskOwners.owned(container, owner) == slots &&
-                ignored == (base + maskSlotsFor(container)).distinct()) {
-                hideNativeNetworkChildren(container)
-                return true
-            }
-            maskOwners.set(container, owner, slots)
-            restoreIgnoredSlots(container, base)
-            hideNativeNetworkChildren(container)
-            (container as? View)?.requestLayout()
-            val result = ignoredSlotsField?.get(container) as? List<*>
-                ?: return rejectMask(owner, "ignoredSlots unavailable")
-            result == (base + maskSlotsFor(container)).distinct() || rejectMask(owner, "host list did not take the mask")
-        }.getOrElse {
-            DebugLog.w(TAG, "container slot mask failed", it)
-            false
-        }
-    }
-
-    private fun rejectMask(owner: RendererId, reason: String): Boolean {
-        DebugLog.w(TAG, "container slot mask rejected owner=$owner reason=$reason")
-        return false
-    }
-
-    /** Modern mobile/Wi-Fi binders own visibility independently from ignoredSlots. */
-    private fun hideNativeNetworkChildren(container: Any) {
-        val group = container as? ViewGroup ?: return
-        typeOnly.adopt((0 until group.childCount).map(group::getChildAt))
-        val slots = maskSlotsFor(container)
-        val state = containerStates[container] ?: run {
-            val ignored = ignoredSlotsField?.get(container) as? List<*> ?: return
-            captureContainerState(container, ignored)
-        }
-        val hostBlocked = if (restoring) state.hostIgnored else state.lastApplied ?: blockedFor(
-            container, surfaceFor(container, state.hostIgnored), state.hostIgnored
-        )
-        for (index in 0 until group.childCount) {
-            val child = group.getChildAt(index)
-            val slot = slotOf(child) ?: continue
-            val masked = slot in slots || mobileRowMasked(child)
-            reconcileNativeVisibility(child, masked)
-            val entry = networkVisibility.entries.firstOrNull { it.key.isInstance(child) } ?: continue
-            if (masked) {
-                if (!state.nativeVisibleStates.containsKey(child)) {
-                    readNativeVisibleState(child)?.let { state.nativeVisibleStates[child] = it }
-                }
-                if (state.nativeVisibleStates.containsKey(child)) {
-                    invokeNativeVisibleState(entry.value, child, 2)
-                }
-            } else if (slot in hostBlocked) {
-                state.nativeVisibleStates.remove(child)
-                invokeNativeVisibleState(entry.value, child, 2)
-            } else {
-                val previous = state.nativeVisibleStates.remove(child) ?: continue
-                invokeNativeVisibleState(entry.value, child, previous)
-            }
-        }
-    }
-
-    private fun readNativeVisibleState(view: View): Int? = runCatching {
-        val field = findField(view.javaClass, "iconVisibleState")
-        field?.getInt(view)
-    }.getOrNull()
-
-    private fun invokeNativeVisibleState(method: Method, view: View, state: Int) {
-        // The host setter may schedule binding/layout work even when asked for the same state.
-        if (readNativeVisibleState(view) == state) return
-        val previous = applyingNativeVisibility
-        applyingNativeVisibility = true
-        try {
-            method.invoke(view, state, false)
-        } catch (error: Throwable) {
-            DebugLog.w(TAG, "modern network visibility restore failed", error)
-        } finally {
-            applyingNativeVisibility = previous
-        }
-    }
-
-    private fun createSlot(owner: Any, name: String): Any? {
-        val constructor = slotConstructor ?: run {
-            val slotClass = SLOT_CLASS.toClassOrNull() ?: return null
-            slotClass.getDeclaredConstructor(String::class.java).apply { isAccessible = true }
-                .also { slotConstructor = it }
-        }
-        return runCatching { constructor.newInstance(name) }.getOrNull()
-    }
-
-    private fun readSlotName(slot: Any?): String? {
-        if (slot == null) return null
-        val field = slotNameField ?: findField(slot.javaClass, "mName").also { slotNameField = it }
-        return runCatching { field?.get(slot) as? String }.getOrNull()
-    }
+    fun setDuoMask(container: Any, active: Boolean, surface: PlanSurface? = null): Boolean = false
+    internal fun duoOwnsAirplane(container: Any): Boolean = false
+    internal fun setCarrierMask(container: Any, mask: CarrierMask): Boolean = false
+    internal fun setAirplaneLabelMask(container: Any, active: Boolean): Boolean = false
+    internal fun updateLowerRowHandover(real: ViewGroup, fake: ViewGroup, progress: Float) {}
+    internal fun clearLowerRowHandover() {}
 
     private fun findField(type: Class<*>, name: String): Field? = HostAccess.field(type, name)
 
@@ -823,273 +292,6 @@ internal object SlotMaskApplier : IconRenderer() {
             current = current.superclass
         }
         return null
-    }
-
-    private fun disableClipping(group: ViewGroup) {
-        clipStates.putIfAbsent(group, group.clipChildren to group.clipToPadding)
-        group.clipChildren = false
-        group.clipToPadding = false
-    }
-
-    /** Reuse the existing carrier expansion clock and source drawing for lower status icons. */
-    internal fun updateLowerRowHandover(real: ViewGroup, fake: ViewGroup, progress: Float) {
-        if (retiring || !ownsTwoLineLayout(real)) { clearLowerRowHandover(); return }
-        val root = real.rootView as? ViewGroup ?: run { clearLowerRowHandover(); return }
-        val sources = HashMap<String, View>()
-        for (index in 0 until fake.childCount) {
-            val view = fake.getChildAt(index)
-            val slot = slotOf(view) ?: continue
-            if (isHostLayoutVisible(view, slot, fake)) sources[slot] = view
-        }
-        val used = HashSet<View>()
-        val leftOwned = IconHostPorts.left.homeSlots()
-        for (index in 0 until real.childCount) {
-            val target = real.getChildAt(index)
-            val slot = slotOf(target) ?: continue
-            if (!IconSlotPolicy.ownsLowerRowMotion(slot, leftOwned, rowOverrides) || !isHostLayoutVisible(target, slot, real)) continue
-            val source = sources[slot] ?: continue
-            if (lowerRowMotions[target]?.source !== source) lowerRowMotions.remove(target)?.restore()
-            val existing = lowerRowMotions[target]
-            val owners = HandoverCoordinator.statusIcons
-            if (listOf(source, target).any { it in owners && (existing == null || !owners.owns(it, existing)) }) continue
-            val state = existing ?: LowerRowMotion(source, target).also { lowerRowMotions[target] = it }
-            owners.acquire(source, state)
-            owners.acquire(target, state)
-            if (abs(source.alpha - state.appliedAlpha) > .001f) state.savedAlpha = source.alpha
-            val ready = state.motion.update(root, source, target, progress)
-            state.appliedAlpha = if (ready) 0f else state.savedAlpha
-            if (source.alpha != state.appliedAlpha) source.alpha = state.appliedAlpha
-            used += target
-        }
-        lowerRowMotions.entries.removeIf { (target, state) ->
-            if (target in used) false else { state.restore(); true }
-        }
-    }
-
-    internal fun clearLowerRowHandover() {
-        lowerRowMotions.values.forEach { it.restore() }
-        lowerRowMotions.clear()
-    }
-
-    /** Publish row targets before the host applies/animates its NewStatusIconState objects. */
-    private fun prepareControlCenterRows(container: ViewGroup, access: HostRowStateAccess) {
-        if (retiring || !ownsTwoLineLayout(container) || container.height <= 0) return
-        val geometry = controlCenterRowGeometry(container) ?: return
-        val battery = effectiveBattery(container) ?: return
-        // MiuiStatusBatteryContainer lays out its battery before statusIcons. Both are direct
-        // siblings, so these bounds belong to this traversal even while the header's carrier
-        // sibling still has its previous orientation's screen position.
-        val anchors = TwoRowIconLayout.anchors(
-            battery.left, battery.top, battery.width, battery.height,
-            container.left, container.top, geometry.secondCenter - geometry.firstCenter
-        )
-        val states = access.layoutStates.get(container) as? List<*> ?: return
-        val nativeStates = IdentityHashMap<View, Any>()
-        for (raw in states) {
-            val state = raw ?: continue
-            val view = access.view.get(state) as? View ?: continue
-            if (view.parent === container) nativeStates[view] = state
-        }
-        val items = ArrayList<TwoRowIconLayout.Item>()
-        val children = HashMap<Int, Pair<View, Any>>()
-        for (index in 0 until container.childCount) {
-            val view = container.getChildAt(index)
-            val slot = slotOf(view) ?: continue
-            val state = nativeStates[view] ?: continue
-            // Use the final host visibility model, including explicit masks and remove state.
-            // An appearance fade must not collapse either row's horizontal positions.
-            if (access.gone.getBoolean(state) || access.visibleState.getInt(state) != 0 ||
-                !isHostLayoutVisible(view, slot, container)) continue
-            val removing = HostAccess.cached(view.javaClass, "icon-position:removeFlagGetters", Method::class.java) {
-                findNoArgMethod(view.javaClass, "getRemoveFlag")
-            }?.let { runCatching { it.invoke(view) as? Boolean }.getOrNull() } ?: false
-            if (removing) continue
-            items += TwoRowIconLayout.Item(index, occupiedWidth(view), IconSlotPolicy.isTwoLineUpperSlot(slot, rowOverrides))
-            children[index] = view to state
-        }
-        val spacingId = ResourceLookup.identifier(container.resources, "status_bar_system_icon_spacing", "dimen", "com.android.systemui")
-        val spacing = if (spacingId != 0) container.resources.getDimensionPixelSize(spacingId).toFloat() else 0f
-        val positions = TwoRowIconLayout.positions(items,
-            upperRight = anchors.upperRight,
-            lowerRight = anchors.lowerRight,
-            spacing = spacing, rtl = container.layoutDirection == View.LAYOUT_DIRECTION_RTL)
-        disableClipping(container)
-        var parent = container.parent as? ViewGroup
-        while (parent != null) {
-            disableClipping(parent)
-            if (parent.javaClass.name == CONTROL_CENTER_ROW_CLASS) break
-            parent = parent.parent as? ViewGroup
-        }
-        for (item in items) {
-            val (view, state) = children.getValue(item.index)
-            val x = positions.getValue(item.index)
-            // X belongs to the native Folme state. Do not snap the child or cancel its animator.
-            access.translationX.setFloat(state, x)
-            access.layoutTranslationX.setFloat(state, x)
-            // The host state has no Y property. Use final child bounds within this layout pass;
-            // QS_FAKE remains one row and native appearance/expansion still owns the movement.
-            val center = if (item.upper) anchors.firstCenter else anchors.secondCenter
-            val top = (center - view.height / 2f).toInt()
-            view.layout(view.left, top, view.right, top + view.height)
-        }
-        publishCarrierRowSlack(container, items, positions, anchors, spacing)
-    }
-
-    /**
-     * The carrier block ends at the status root, whose width is the host's single-row sum of every
-     * icon. Once the icons are split over two lines, each line leaves part of that width free.
-     * Report it per line so each carrier row is budgeted against its own icons, not against both.
-     * Only the real (non-fake) LTR row reports; anything else clears the budget to native.
-     */
-    private fun publishCarrierRowSlack(container: ViewGroup, items: List<TwoRowIconLayout.Item>,
-                                       positions: Map<Int, Float>, anchors: TwoRowIconLayout.Anchors,
-                                       spacing: Float) {
-        val (carrier, realRow) = controlCenterCarrier(container) ?: return
-        if (!realRow) return
-        if (container.layoutDirection == View.LAYOUT_DIRECTION_RTL) {
-            IconHostPorts.carrier.rowSlack(carrier, 0, 0)
-            return
-        }
-        val offset = leftWithin(container, carrier.parent as? ViewGroup ?: return) ?: run {
-            IconHostPorts.carrier.rowSlack(carrier, 0, 0)
-            return
-        }
-        fun slack(upper: Boolean): Int {
-            val lineLeft = items.filter { it.upper == upper }.minOfOrNull { positions.getValue(it.index) }
-                ?: if (upper) anchors.upperRight else anchors.lowerRight
-            return (offset + lineLeft - spacing - carrier.right).toInt().coerceAtLeast(0)
-        }
-        IconHostPorts.carrier.rowSlack(carrier, slack(upper = true), slack(upper = false))
-    }
-
-    /** Clears a stale per-line budget once this control-center row stops owning two lines. */
-    private fun clearCarrierRowSlack(container: ViewGroup) {
-        val (carrier, realRow) = controlCenterCarrier(container) ?: return
-        if (realRow) IconHostPorts.carrier.rowSlack(carrier, 0, 0)
-    }
-
-    /** Layout-coordinate left of [view] inside [ancestor]; transforms are ignored on purpose. */
-    private fun leftWithin(view: View, ancestor: ViewGroup): Float? {
-        var x = 0f
-        var current: View = view
-        while (current !== ancestor) {
-            x += current.left
-            current = current.parent as? View ?: return null
-        }
-        return x
-    }
-
-    private fun isControlCenterContainer(container: View): Boolean {
-        var parent = container.parent as? View
-        while (parent != null) {
-            if (parent.javaClass.name == CONTROL_CENTER_ROW_CLASS ||
-                parent.javaClass.name == CONTROL_CENTER_FAKE_ROW_CLASS
-            ) return true
-            parent = parent.parent as? View
-        }
-        return false
-    }
-
-    /** Only row spacing comes from the carrier; its screen location may be from the last layout. */
-    private fun controlCenterRowGeometry(container: ViewGroup): TwoRowIconLayout.Geometry? =
-        controlCenterCarrier(container)?.first?.let(IconHostPorts.carrier.geometry)
-
-    /** The header's carrier block for a control-center status container, and whether it is the real row. */
-    private fun controlCenterCarrier(container: ViewGroup): Pair<ViewGroup, Boolean>? {
-        var rowRoot: ViewGroup? = container.parent as? ViewGroup
-        while (rowRoot != null &&
-            rowRoot.javaClass.name != CONTROL_CENTER_ROW_CLASS &&
-            rowRoot.javaClass.name != CONTROL_CENTER_FAKE_ROW_CLASS
-        ) {
-            rowRoot = rowRoot.parent as? ViewGroup
-        }
-        val header = rowRoot?.parent as? ViewGroup ?: return null
-        val carrierId = ResourceLookup.identifier(header.resources,
-            "normal_control_center_carrier_layout", "id", "com.android.systemui"
-        )
-        if (carrierId == 0) return null
-        val carrier = header.findViewById<View>(carrierId) as? ViewGroup ?: return null
-        return carrier to (rowRoot.javaClass.name == CONTROL_CENTER_ROW_CLASS)
-    }
-
-    /** Current layout owner: native battery, or DuoView while Duo borrows mBattery. */
-    private fun effectiveBattery(container: ViewGroup): View? {
-        val parent = container.parent as? ViewGroup ?: return null
-        val layoutBattery = runCatching {
-            HostAccess.cached(parent.javaClass, "icon-position:batteryLayoutFields", Field::class.java) {
-                findField(parent.javaClass, "mBattery")
-            }?.get(parent) as? View
-        }.getOrNull()
-        val battery = layoutBattery ?: run {
-            val batteryId = ResourceLookup.identifier(parent.resources, 
-                "battery", "id", "com.android.systemui"
-            )
-            if (batteryId == 0) return null
-            parent.findViewById<View>(batteryId) ?: return null
-        }
-        if (battery.parent !== parent || battery.visibility != View.VISIBLE ||
-            battery.width <= 0 || battery.height <= 0) {
-            return null
-        }
-        return battery
-    }
-
-    private fun isHostLayoutVisible(view: View, slot: String, container: ViewGroup, requireWidth: Boolean = true): Boolean {
-        // Child alpha is animated independently during row/proxy handoffs; model visibility is the
-        // stable ownership signal. Dropping an alpha-zero child here would change row packing in the
-        // middle of the fade and recreate a transient empty slot.
-        if (view.visibility != View.VISIBLE || requireWidth && view.width <= 0) return false
-        val ignored = runCatching { ignoredSlotsField?.get(container) as? List<*> }.getOrNull()
-        if (ignored?.contains(slot) == true) return false
-        val visible = HostAccess.cached(view.javaClass, "icon-position:iconVisibleGetters", Method::class.java) {
-            findNoArgMethod(view.javaClass, "isIconVisible")
-        }?.let { runCatching { it.invoke(view) as? Boolean }.getOrNull() } ?: true
-        val blocked = HostAccess.cached(view.javaClass, "icon-position:iconBlockedGetters", Method::class.java) {
-            findNoArgMethod(view.javaClass, "isIconBlocked")
-        }?.let { runCatching { it.invoke(view) as? Boolean }.getOrNull() } ?: false
-        return visible && !blocked
-    }
-
-    private fun occupiedWidth(view: View): Float {
-        val networkSpeedWidth = if (view.javaClass.name == NETWORK_SPEED_CLASS) {
-            HostAccess.cached(view.javaClass, "icon-position:networkSpeedWidthGetters", Method::class.java) {
-                findNoArgMethod(view.javaClass, "getNetworkSpeedWidth")
-            }?.let { runCatching { (it.invoke(view) as? Number)?.toFloat() }.getOrNull() }
-        } else {
-            null
-        }
-        return (networkSpeedWidth ?: (
-            view.width + view.paddingStart + view.paddingEnd
-            ).toFloat()).coerceAtLeast(0f)
-    }
-
-    private fun findNoArgMethod(type: Class<*>, name: String): Method? {
-        var current: Class<*>? = type
-        while (current != null) {
-            runCatching {
-                return HostAccess.requireDeclaredMethod(current, name, accessible = true)
-            }
-            runCatching {
-                return HostAccess.requirePublicMethod(current, name, accessible = true)
-            }
-            current = current.superclass
-        }
-        return null
-    }
-
-    private fun slotOf(view: View): String? {
-        val getter = HostAccess.cached(view.javaClass, "icon-position:slotGetters", Method::class.java) {
-            var current: Class<*>? = view.javaClass
-            var found: Method? = null
-            while (current != null && found == null) {
-                found = current.interfaces.firstNotNullOfOrNull { iface ->
-                    runCatching { HostAccess.requirePublicMethod(iface, "getSlot", accessible = true) }.getOrNull()
-                } ?: runCatching { HostAccess.requirePublicMethod(current, "getSlot", accessible = true) }.getOrNull()
-                current = current.superclass
-            }
-            found?.apply { isAccessible = true }
-        }
-        return getter?.let { runCatching { it.invoke(view) as? String }.getOrNull() }
     }
 
     private fun stableStrings(values: List<*>): List<String> {
